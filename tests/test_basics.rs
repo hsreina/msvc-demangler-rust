@@ -193,6 +193,51 @@ fn other_tests() {
     );
 }
 
+// Decorations emitted by Visual C++ 7.1 (Visual Studio .NET 2003). Expected
+// strings are undname's, modulo whitespace.
+#[test]
+fn test_vc71_decorations() {
+    let expect = |input, reference| {
+        expect_with_flags(input, reference, 0x0);
+    };
+
+    // A cv-qualified enum template argument.
+    expect(
+        "??1?$pair@$$CBW4enumElement@@H@std@@QAE@XZ",
+        "public: __thiscall std::pair<enum enumElement const,int>::~pair<enum enumElement const,int>(void)",
+    );
+    // The address of a global variable as a template argument.
+    expect(
+        "??0?$_IDispEventLocator@$0CF@$1?DIID_DWebBrowserEvents2@@3U_GUID@@B@ATL@@QAE@XZ",
+        "public: __thiscall ATL::_IDispEventLocator<37,&struct _GUID const DIID_DWebBrowserEvents2>::_IDispEventLocator<37,&struct _GUID const DIID_DWebBrowserEvents2>(void)",
+    );
+    // The address of a static member variable as a template argument.
+    expect(
+        "??0?$IDispatchImpl@UIAxWinAmbientDispatchEx@@$1?_GUID_b2d0778b_ac99_4c58_a5c8_e7724e5316b5@@3U__s_GUID@@B$1?m_libid@CAtlModule@ATL@@2U_GUID@@A$0PPPP@$0PPPP@VCComTypeInfoHolder@ATL@@@ATL@@QAE@XZ",
+        "public: __thiscall ATL::IDispatchImpl<struct IAxWinAmbientDispatchEx,&struct __s_GUID const _GUID_b2d0778b_ac99_4c58_a5c8_e7724e5316b5,&public: static struct _GUID ATL::CAtlModule::m_libid,65535,65535,class ATL::CComTypeInfoHolder>::IDispatchImpl<struct IAxWinAmbientDispatchEx,&struct __s_GUID const _GUID_b2d0778b_ac99_4c58_a5c8_e7724e5316b5,&public: static struct _GUID ATL::CAtlModule::m_libid,65535,65535,class ATL::CComTypeInfoHolder>(void)",
+    );
+    // A const pointer to a function.
+    expect(
+        "??0?$pair@$$CBUtypename_pair@@P6IXPBXPAX@Z@std@@QAE@ABUtypename_pair@@ABQ6IXPBXPAX@Z@Z",
+        "public: __thiscall std::pair<struct typename_pair const,void (__fastcall *)(void const *,void *)>::pair<struct typename_pair const,void (__fastcall *)(void const *,void *)>(struct typename_pair const &,void (__fastcall * const &)(void const *,void *))",
+    );
+    // The destructor helper of a function-local static.
+    expect(
+        "?_Instance@?1??Instance@CEquipHelper@@SIPAV1@XZ@$AV1@A",
+        "[thunk]:class Instance `public: static class Instance * __fastcall CEquipHelper::Instance(void)'::`2'::_Instance`local static destructor helper'",
+    );
+}
+
+// undname prints `CGatewayActor::*const &`: the pointer's own qualifier is
+// not represented for a pointer to member function.
+#[test]
+fn test_vc71_const_member_function_pointer() {
+    expect_failure(
+        "??0?$pair@PBDP8CGatewayActor@_gateway@@AEXXZ@std@@QAE@ABQBDABQ8CGatewayActor@_gateway@@AEXXZ@Z",
+        "public: __thiscall std::pair<char const *,void (__thiscall _gateway::CGatewayActor::*)(void)>::pair<char const *,void (__thiscall _gateway::CGatewayActor::*)(void)>(char const * const &,void (__thiscall _gateway::CGatewayActor::*const &)(void))",
+    );
+}
+
 #[test]
 fn test_strings() {
     let expect = |input, reference| {

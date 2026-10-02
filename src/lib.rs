@@ -423,6 +423,10 @@ pub enum Type<'a> {
     RValueRef(Box<Type<'a>>, StorageClass),
     Array(i32, Box<Type<'a>>, StorageClass),
     Var(Box<Type<'a>>, VarStorageKind, StorageClass),
+    // `$1?sym@@3<type><q>` template argument: the address of a variable.
+    VarAddress(Symbol<'a>, Box<Type<'a>>, VarStorageKind, StorageClass),
+    // `$A<type><q>`: the destructor helper of a function-local static.
+    LocalStaticDestructorHelper(Box<Type<'a>>, StorageClass),
 
     Alias(Symbol<'a>, StorageClass),
     Struct(Symbol<'a>, StorageClass),
@@ -618,6 +622,13 @@ impl<'a> ParserState<'a> {
                         }
                     };
                     self.read_encoded_string(char_bytes)?
+                }
+                b'$' if self.consume(b"A") => {
+                    // `?x@?1??f@@...@$AV1@A`: the atexit destructor
+                    // helper cl emits for a function-local static object.
+                    let ty = self.read_var_type(StorageClass::empty())?;
+                    let sc = self.read_storage_class();
+                    Type::LocalStaticDestructorHelper(Box::new(ty), sc)
                 }
                 b'$' => {
                     self.expect(b"B")?;
@@ -1271,6 +1282,14 @@ impl<'a> ParserState<'a> {
 
     fn read_member_function_pointer(&mut self, read_qualifiers: bool) -> Result<Type<'a>> {
         let symbol = self.read_name(true)?;
+        self.read_member_function_pointer_rest(symbol, read_qualifiers)
+    }
+
+    fn read_member_function_pointer_rest(
+        &mut self,
+        symbol: Symbol<'a>,
+        read_qualifiers: bool,
+    ) -> Result<Type<'a>> {
         let ptr64 = if self.consume(b"E") {
             StorageClass::PTR64
         } else {
@@ -1297,7 +1316,7 @@ impl<'a> ParserState<'a> {
     }
 
     // Reads a variable type.
-    fn read_var_type(&mut self, mut sc: StorageClass) -> Result<Type<'a>> {
+    fn read_var_type(&mut self, sc: StorageClass) -> Result<Type<'a>> {
         if self.consume(b"W4") {
             let name = self.read_name(false)?;
             return Ok(Type::Enum(name, sc));
@@ -1313,7 +1332,9 @@ impl<'a> ParserState<'a> {
             return Ok(Type::Ptr(Box::new(func_type), sc));
         }
 
-        if self.consume(b"P8") {
+        // A (cv-qualified) pointer to member function prints its own `::*`.
+        if self.consume(b"P8") || self.consume(b"Q8") || self.consume(b"R8") || self.consume(b"S8")
+        {
             return self.read_member_function_pointer(true);
         }
 
@@ -1354,12 +1375,32 @@ impl<'a> ParserState<'a> {
             }
             // These next cases can fallthrough, so be careful adding new ones!
             if self.consume(b"$C") {
-                sc = self.read_qualifier();
+                // A qualified type (`$$CBW4enumElement@@` = `enum enumElement const`)
+                // is any type, not only a primitive one: parse it from the top, so
+                // enums (W4) and function pointers (P6/A6) are recognised too.
+                let sc = self.read_qualifier();
+                return self.read_var_type(sc);
             } else if let Some(b'1' | b'H' | b'I' | b'J') = self.peek() {
                 // Inheritance specifiers, which we don't need to remember.
                 self.advance(1);
                 self.expect(b"?")?;
-                return self.read_member_function_pointer(false);
+                let symbol = self.read_name(true)?;
+                // `$1?sym@@3U_GUID@@B` is the address of a variable
+                // (`&struct _GUID const sym`), not of a member function.
+                if let Some(c @ b'0'..=b'4') = self.peek() {
+                    self.advance(1);
+                    let kind = match c {
+                        b'0' => VarStorageKind::PrivateStatic,
+                        b'1' => VarStorageKind::ProtectedStatic,
+                        b'2' => VarStorageKind::PublicStatic,
+                        b'3' => VarStorageKind::Global,
+                        _ => VarStorageKind::FunctionLocalStatic,
+                    };
+                    let ty = self.read_var_type(StorageClass::empty())?;
+                    let sc = self.read_storage_class();
+                    return Ok(Type::VarAddress(symbol, Box::new(ty), kind, sc));
+                }
+                return self.read_member_function_pointer_rest(symbol, false);
             }
         }
 
@@ -1424,6 +1465,12 @@ impl<'a> ParserState<'a> {
     }
 
     fn read_pointee(&mut self) -> Result<Type<'a>> {
+        // `Q6IXPBXPAX@Z` (`void (__fastcall *const)(void const *, void *)`):
+        // only P6/A6 were recognised, so a const pointer to a function fell
+        // through to the back-reference digits.
+        if self.consume(b"6") {
+            return self.read_func_type(false);
+        }
         let ptr64 = if self.consume(b"E") {
             StorageClass::PTR64
         } else {
@@ -1765,6 +1812,36 @@ impl Serializer<'_> {
                 self.write_pre(inner);
                 sc
             }
+            Type::VarAddress(ref symbol, ref inner, kind, sc) => {
+                // undname: `&struct _GUID const DIID_DWebBrowserEvents2`,
+                // `&public: static struct _GUID ATL::CAtlModule::m_libid`
+                self.w.push(b'&');
+                match kind {
+                    VarStorageKind::PrivateStatic => self.w.extend(b"private: static "),
+                    VarStorageKind::ProtectedStatic => self.w.extend(b"protected: static "),
+                    VarStorageKind::PublicStatic => self.w.extend(b"public: static "),
+                    VarStorageKind::Global | VarStorageKind::FunctionLocalStatic => {}
+                }
+                self.write_pre(inner);
+                self.write_post(inner);
+                if sc.contains(StorageClass::CONST) {
+                    self.write_space();
+                    self.w.extend(b"const");
+                }
+                if sc.contains(StorageClass::VOLATILE) {
+                    self.write_space();
+                    self.w.extend(b"volatile");
+                }
+                self.write_space();
+                self.write_name(symbol, None);
+                return;
+            }
+            Type::LocalStaticDestructorHelper(ref inner, sc) => {
+                // undname: "[thunk]:class X `f'::`2'::name`local static destructor helper'"
+                self.w.extend(b"[thunk]:");
+                self.write_pre(inner);
+                sc
+            }
             Type::Alias(ref names, sc) => {
                 self.write_name(names, None);
                 sc
@@ -1988,6 +2065,10 @@ impl Serializer<'_> {
             }
             Type::Var(ref inner, _kind, _sc) => {
                 self.write_post(inner);
+            }
+            Type::LocalStaticDestructorHelper(ref inner, _sc) => {
+                self.write_post(inner);
+                self.w.extend(b"`local static destructor helper'");
             }
             Type::CXXVFTable(ref names, _) => {
                 if !names.names.is_empty() {
